@@ -221,6 +221,14 @@ func (w *ClientWorkspace) ListAllUserMessages(ctx context.Context) ([]message.Me
 	return protoToMessages(msgs), nil
 }
 
+// ponytail: local-only until someone actually attaches a TUI to a remote
+// crush serve. Upgrade path: add POST
+// /workspaces/{id}/sessions/{sid}/messages/undo on server, matching client
+// call, and Backend.DeleteMessagesAfter.
+func (w *ClientWorkspace) DeleteMessagesAfter(ctx context.Context, sessionID, messageID string) error {
+	return errors.New("undo not supported in remote (client/server) mode")
+}
+
 // -- Agent --
 
 func (w *ClientWorkspace) AgentRun(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) error {

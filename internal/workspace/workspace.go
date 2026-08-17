@@ -134,6 +134,10 @@ type Workspace interface {
 	ListMessages(ctx context.Context, sessionID string) ([]message.Message, error)
 	ListUserMessages(ctx context.Context, sessionID string) ([]message.Message, error)
 	ListAllUserMessages(ctx context.Context) ([]message.Message, error)
+	// DeleteMessagesAfter removes the message identified by messageID and every
+	// message in the session created at or after it. Powers /undo. Remote-mode
+	// implementations may return an error until the HTTP route is wired.
+	DeleteMessagesAfter(ctx context.Context, sessionID, messageID string) error
 
 	// Agent
 	AgentRun(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) error
