@@ -663,3 +663,71 @@ func unmarshalParts(data []byte) ([]ContentPart, error) {
 
 	return parts, nil
 }
+
+// wireMessage mirrors Message for JSON round-trip, storing Parts as the
+// wrapped-JSON payload that marshalParts / unmarshalParts already handle
+// (they carry the ContentPart discriminator that a naive json.Marshal on
+// the interface slice would lose).
+type wireMessage struct {
+	ID               string          `json:"id"`
+	Role             MessageRole     `json:"role"`
+	SessionID        string          `json:"session_id"`
+	Parts            json.RawMessage `json:"parts"`
+	Model            string          `json:"model"`
+	Provider         string          `json:"provider"`
+	CreatedAt        int64           `json:"created_at"`
+	UpdatedAt        int64           `json:"updated_at"`
+	IsSummaryMessage bool            `json:"is_summary_message"`
+}
+
+// MarshalMessages serialises a slice of Message losslessly, including
+// the discriminated ContentPart types. Intended for on-disk persistence
+// (e.g. the /undo redo stack). Not used on the SQL hot path.
+func MarshalMessages(msgs []Message) ([]byte, error) {
+	wire := make([]wireMessage, len(msgs))
+	for i, msg := range msgs {
+		parts, err := marshalParts(msg.Parts)
+		if err != nil {
+			return nil, fmt.Errorf("marshal message %s parts: %w", msg.ID, err)
+		}
+		wire[i] = wireMessage{
+			ID:               msg.ID,
+			Role:             msg.Role,
+			SessionID:        msg.SessionID,
+			Parts:            parts,
+			Model:            msg.Model,
+			Provider:         msg.Provider,
+			CreatedAt:        msg.CreatedAt,
+			UpdatedAt:        msg.UpdatedAt,
+			IsSummaryMessage: msg.IsSummaryMessage,
+		}
+	}
+	return json.Marshal(wire)
+}
+
+// UnmarshalMessages reverses MarshalMessages.
+func UnmarshalMessages(data []byte) ([]Message, error) {
+	var wire []wireMessage
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, err
+	}
+	msgs := make([]Message, len(wire))
+	for i, w := range wire {
+		parts, err := unmarshalParts(w.Parts)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal message %s parts: %w", w.ID, err)
+		}
+		msgs[i] = Message{
+			ID:               w.ID,
+			Role:             w.Role,
+			SessionID:        w.SessionID,
+			Parts:            parts,
+			Model:            w.Model,
+			Provider:         w.Provider,
+			CreatedAt:        w.CreatedAt,
+			UpdatedAt:        w.UpdatedAt,
+			IsSummaryMessage: w.IsSummaryMessage,
+		}
+	}
+	return msgs, nil
+}

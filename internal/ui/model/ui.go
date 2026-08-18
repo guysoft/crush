@@ -178,16 +178,22 @@ type (
 	}
 
 	// reloadSessionMessagesMsg is sent to reload messages for the current session.
-	// reloadSessionMessagesMsg is sent to reload messages for the current
-	// session. undoUserText, when non-empty, is the text of the user message
-	// removed by the /undo action that triggered this reload — the Update
-	// handler drops it back into the textarea so the user can edit and
-	// re-send (or clear and start fresh). Empty when the reload was not
-	// undo-driven, when the undone turn had no text (e.g. attachments only),
-	// or when the caller has no such text to hand back.
+	// reloadSessionMessagesMsg is sent to reload messages for the current session.
 	reloadSessionMessagesMsg struct {
-		messages     []message.Message
-		undoUserText string
+		messages []message.Message
+	}
+
+	// undoAppliedMsg is emitted after handleUndoCommand's DB work completes;
+	// the UI pushes `removed` onto redoStack (main goroutine, avoiding races
+	// with concurrent Update handlers) and reloads via `reload`. userText
+	// carries the text of the undone user message so the Update handler can
+	// re-populate the input for edit-and-resend — empty when the undone
+	// turn had no text (e.g. an attachment-only user turn) or when the
+	// textarea already has in-progress typing we should not clobber.
+	undoAppliedMsg struct {
+		removed  []message.Message
+		reload   []message.Message
+		userText string
 	}
 )
 
@@ -394,6 +400,13 @@ type UI struct {
 		index    int
 		draft    string
 	}
+
+	// redoStack holds paths to temp-file snapshots of message tails
+	// removed by /undo. Each entry = one undo batch. Popped by /redo,
+	// cleared by any new send, session switch, or shutdown. See
+	// handleUndoCommand / handleRedoCommand / redoStackReset.
+	redoStack []string
+	redoDir   string
 }
 
 // New creates a new instance of the [UI] model.
@@ -759,6 +772,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.session = msg.session
 		m.sidebarOffset = 0
 		m.sessionFiles = msg.files
+		// Session switch: redo history is session-scoped. Any pending
+		// /redo frames belong to whatever we were just looking at.
+		m.redoStackReset()
 		// Session switch: the memoized busy state and queued prompts
 		// belong to the previous session. Drop them and re-fetch
 		// off-thread so the queue pill and esc behavior track the new
@@ -820,13 +836,21 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.setSessionMessages(msg.messages); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+
+	case undoAppliedMsg:
+		if err := m.redoStackPush(msg.removed); err != nil {
+			cmds = append(cmds, util.ReportWarn(fmt.Sprintf("Undo applied but redo unavailable: %v", err)))
+		}
+		if cmd := m.setSessionMessages(msg.reload); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		// Edit-and-resend flow: drop the undone user text back into the
 		// input so the user can tweak and re-send (or clear and start
 		// over). Only when the textarea is empty — a user mid-typing
 		// something new should not have their draft clobbered by /undo.
-		if msg.undoUserText != "" && strings.TrimSpace(m.textarea.Value()) == "" {
+		if msg.userText != "" && strings.TrimSpace(m.textarea.Value()) == "" {
 			prevHeight := m.textarea.Height()
-			m.textarea.SetValue(msg.undoUserText)
+			m.textarea.SetValue(msg.userText)
 			m.textarea.MoveToEnd()
 			m.syncBangModeFromTextarea()
 			cmds = append(cmds, m.textarea.Focus())
@@ -1542,6 +1566,8 @@ func (m *UI) reloadSessionMessages() tea.Cmd {
 }
 
 // handleUndoCommand deletes the last user message and all messages after it.
+// The removed tail is stashed to a temp file via undoAppliedMsg so /redo can
+// restore it.
 func (m *UI) handleUndoCommand() tea.Cmd {
 	return func() tea.Msg {
 		if !m.hasSession() {
@@ -1568,6 +1594,20 @@ func (m *UI) handleUndoCommand() tea.Cmd {
 		// the DELETE so we don't lose it to a race with the reload.
 		undoUserText := lastUserMessage.Content().Text
 
+		// Fetch full list so we can capture the tail we're about to delete
+		// (needed for /redo). Matches the SQL predicate used by
+		// DeleteMessagesAfter: created_at >= lastUser.CreatedAt.
+		allMessages, err := m.com.Workspace.ListMessages(ctx, m.session.ID)
+		if err != nil {
+			return util.ReportError(fmt.Errorf("failed to list messages: %w", err))()
+		}
+		var removed []message.Message
+		for _, ms := range allMessages {
+			if ms.CreatedAt >= lastUserMessage.CreatedAt {
+				removed = append(removed, ms)
+			}
+		}
+
 		// Delete the last user message and everything after it.
 		if err := m.com.Workspace.DeleteMessagesAfter(ctx, m.session.ID, lastUserMessage.ID); err != nil {
 			return util.ReportError(fmt.Errorf("failed to undo: %w", err))()
@@ -1578,7 +1618,121 @@ func (m *UI) handleUndoCommand() tea.Cmd {
 		if err != nil {
 			return util.ReportError(fmt.Errorf("failed to reload messages: %w", err))()
 		}
-		return reloadSessionMessagesMsg{messages: msgs, undoUserText: undoUserText}
+		return undoAppliedMsg{removed: removed, reload: msgs, userText: undoUserText}
+	}
+}
+
+// redoStackMaxFrames caps the on-disk redo history. Oldest frame is
+// silently dropped when the cap is exceeded. Editor-standard behavior;
+// no user is going to notice past 100 undos.
+const redoStackMaxFrames = 100
+
+// redoStackPush serialises the given tail to a temp file and pushes its
+// path onto m.redoStack. Creates m.redoDir lazily. If the stack exceeds
+// redoStackMaxFrames, the oldest frame is removed from disk.
+//
+// Must be called on the main (Update) goroutine — mutates m.redoStack.
+func (m *UI) redoStackPush(msgs []message.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	if m.redoDir == "" {
+		dir, err := os.MkdirTemp("", "crush-redo-*")
+		if err != nil {
+			return fmt.Errorf("create redo temp dir: %w", err)
+		}
+		m.redoDir = dir
+	}
+	data, err := message.MarshalMessages(msgs)
+	if err != nil {
+		return fmt.Errorf("marshal redo frame: %w", err)
+	}
+	f, err := os.CreateTemp(m.redoDir, "frame-*.json")
+	if err != nil {
+		return fmt.Errorf("create redo frame file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return fmt.Errorf("write redo frame: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return fmt.Errorf("close redo frame: %w", err)
+	}
+	m.redoStack = append(m.redoStack, f.Name())
+	if len(m.redoStack) > redoStackMaxFrames {
+		// Drop oldest frame(s) from disk to keep temp usage bounded.
+		overflow := len(m.redoStack) - redoStackMaxFrames
+		for _, p := range m.redoStack[:overflow] {
+			_ = os.Remove(p)
+		}
+		m.redoStack = m.redoStack[overflow:]
+	}
+	return nil
+}
+
+// redoStackReset removes every stashed frame and the temp dir. Called
+// when a new send branches the history, on session switch, and on
+// shutdown. Safe to call when empty.
+//
+// Must be called on the main (Update) goroutine.
+func (m *UI) redoStackReset() {
+	for _, p := range m.redoStack {
+		_ = os.Remove(p)
+	}
+	m.redoStack = nil
+	if m.redoDir != "" {
+		_ = os.RemoveAll(m.redoDir)
+		m.redoDir = ""
+	}
+}
+
+// handleRedoCommand consumes the frame at `path`, recreating each stashed
+// message via Workspace.CreateMessage in original order, then reloads the
+// session. The path has already been popped from m.redoStack by the
+// caller (see handleDialogMsg's ActionRedo case) to avoid races with
+// concurrent redo attempts.
+func (m *UI) handleRedoCommand(path string) tea.Cmd {
+	return func() tea.Msg {
+		if !m.hasSession() {
+			_ = os.Remove(path)
+			return util.ReportWarn("No active session to redo")()
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			_ = os.Remove(path)
+			return util.ReportError(fmt.Errorf("failed to read redo frame: %w", err))()
+		}
+		_ = os.Remove(path)
+
+		stashed, err := message.UnmarshalMessages(data)
+		if err != nil {
+			return util.ReportError(fmt.Errorf("failed to decode redo frame: %w", err))()
+		}
+		if len(stashed) == 0 {
+			return util.ReportWarn("Nothing to redo")()
+		}
+
+		ctx := context.Background()
+		sessionID := m.session.ID
+		for _, ms := range stashed {
+			if _, err := m.com.Workspace.CreateMessage(ctx, sessionID, message.CreateMessageParams{
+				Role:             ms.Role,
+				Parts:            ms.Parts,
+				Model:            ms.Model,
+				Provider:         ms.Provider,
+				IsSummaryMessage: ms.IsSummaryMessage,
+			}); err != nil {
+				return util.ReportError(fmt.Errorf("failed to redo: %w", err))()
+			}
+		}
+
+		reload, err := m.com.Workspace.ListMessages(ctx, sessionID)
+		if err != nil {
+			return util.ReportError(fmt.Errorf("failed to reload messages: %w", err))()
+		}
+		return reloadSessionMessagesMsg{messages: reload}
 	}
 }
 
@@ -2011,6 +2165,24 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		}
 		cmds = append(cmds, m.handleUndoCommand())
 		m.dialog.CloseDialog(dialog.CommandsID)
+	case dialog.ActionRedo:
+		if m.isAgentBusy() {
+			cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before redoing..."))
+			m.dialog.CloseDialog(dialog.CommandsID)
+			break
+		}
+		if len(m.redoStack) == 0 {
+			cmds = append(cmds, util.ReportWarn("Nothing to redo"))
+			m.dialog.CloseDialog(dialog.CommandsID)
+			break
+		}
+		// Pop synchronously on the main goroutine so concurrent redo
+		// attempts can't race for the same frame.
+		last := len(m.redoStack) - 1
+		path := m.redoStack[last]
+		m.redoStack = m.redoStack[:last]
+		cmds = append(cmds, m.handleRedoCommand(path))
+		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionToggleHelp:
 		m.status.ToggleHelp()
 		m.dialog.CloseDialog(dialog.CommandsID)
@@ -2080,6 +2252,8 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		})
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionQuit:
+		// Clean up any /redo temp-file frames so $TMPDIR doesn't leak.
+		m.redoStackReset()
 		cmds = append(cmds, tea.Quit)
 	case dialog.ActionEnableDockerMCP:
 		m.dialog.CloseDialog(dialog.CommandsID)
@@ -4198,6 +4372,10 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		return util.ReportError(err)
 	}
 
+	// A new user turn branches history: invalidate any pending /redo
+	// frames. Standard editor semantics.
+	m.redoStackReset()
+
 	// Start the turn timer.
 	common.StartTurn()
 
@@ -4801,6 +4979,8 @@ func (m *UI) newSession() tea.Cmd {
 	m.sidebarOffset = 0
 	m.sessionFiles = nil
 	m.sessionFileReads = nil
+	// New session drops any pending /redo history from the previous one.
+	m.redoStackReset()
 	m.setState(uiLanding, uiFocusEditor)
 	m.textarea.Focus()
 	m.chat.Blur()

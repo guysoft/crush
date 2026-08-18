@@ -229,6 +229,12 @@ func (w *ClientWorkspace) DeleteMessagesAfter(ctx context.Context, sessionID, me
 	return errors.New("undo not supported in remote (client/server) mode")
 }
 
+// ponytail: same story as DeleteMessagesAfter. /redo replays messages
+// through message.Service.Create, which has no HTTP wiring here.
+func (w *ClientWorkspace) CreateMessage(ctx context.Context, sessionID string, params message.CreateMessageParams) (message.Message, error) {
+	return message.Message{}, errors.New("redo not supported in remote (client/server) mode")
+}
+
 // -- Agent --
 
 func (w *ClientWorkspace) AgentRun(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) error {

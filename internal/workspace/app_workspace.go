@@ -105,6 +105,10 @@ func (w *AppWorkspace) DeleteMessagesAfter(ctx context.Context, sessionID, messa
 	return w.app.Messages.DeleteMessagesAfter(ctx, sessionID, messageID)
 }
 
+func (w *AppWorkspace) CreateMessage(ctx context.Context, sessionID string, params message.CreateMessageParams) (message.Message, error) {
+	return w.app.Messages.Create(ctx, sessionID, params)
+}
+
 // -- Agent --
 
 func (w *AppWorkspace) AgentRun(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) error {
