@@ -65,12 +65,10 @@ func (m *UI) modelInfo(width int) string {
 }
 
 // agentSidebarLine renders `▪ Plan` in the agent's color for the sidebar
-// slot above the model line. Empty when the user has no primary agent
-// selected (e.g. landing page).
+// slot above the model line. Renders on landing too so the pre-session
+// state clearly telegraphs which agent will handle the first message.
+// Empty only when no primary agents are configured at all.
 func (m *UI) agentSidebarLine() string {
-	if !m.hasSession() {
-		return ""
-	}
 	name := m.agentDisplayName()
 	if name == "" {
 		return ""

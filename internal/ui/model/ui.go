@@ -1748,14 +1748,13 @@ func (m *UI) handleRedoCommand(path string) tea.Cmd {
 
 // cycleAgent moves the primary agent selection forward (direction=+1) or
 // backward (direction=-1) through Workspace.ListPrimaryAgents. Wraps around.
-// If no session is active it warns and does nothing — persistence requires
-// a session row to write to.
+// Works without an active session: the selection lives on m.currentAgentID
+// and is persisted by sendMessage once the session is actually created,
+// so users can pick "Plan" on the landing page and then type their first
+// prompt.
 func (m *UI) cycleAgent(direction int) tea.Cmd {
 	if direction == 0 {
 		direction = 1
-	}
-	if !m.hasSession() {
-		return util.ReportWarn("Start a session first — the agent choice is saved per session.")
 	}
 	agents := m.com.Workspace.ListPrimaryAgents()
 	if len(agents) == 0 {
@@ -1779,21 +1778,13 @@ func (m *UI) cycleAgent(direction int) tea.Cmd {
 	return m.setAgent(agents[next].ID)
 }
 
-// setAgent persists a new primary-agent selection on the current session
-// and updates the on-model mirror so the visual reflects it immediately.
-// If a run is already in flight for this session the workspace call
-// returns queued=true and we warn the user that the change takes effect
-// on the next turn.
+// setAgent updates the primary-agent selection. When a session is active
+// the choice is persisted to the DB immediately (and warned about if the
+// agent is busy — the switch still lands, it applies on the next turn).
+// When no session is active yet, the choice is held on m.currentAgentID
+// and persistLandingAgentSelection() picks it up the moment sendMessage
+// creates a session.
 func (m *UI) setAgent(agentID string) tea.Cmd {
-	if !m.hasSession() {
-		return util.ReportWarn("Start a session first — the agent choice is saved per session.")
-	}
-	sessionID := m.session.ID
-	// Optimistic update — flip the local state right away so the visual
-	// tracks the keypress even if the workspace write takes a moment.
-	// If the write fails we revert below.
-	prev := m.currentAgentID
-	m.currentAgentID = agentID
 	agents := m.com.Workspace.ListPrimaryAgents()
 	name := agentID
 	for _, a := range agents {
@@ -1802,10 +1793,20 @@ func (m *UI) setAgent(agentID string) tea.Cmd {
 			break
 		}
 	}
+	prev := m.currentAgentID
+	m.currentAgentID = agentID
+	if !m.hasSession() {
+		// Pre-session selection: nothing to persist yet, but the mirror
+		// drives the visuals so the user sees the switch. sendMessage
+		// will call SetCurrentAgent once it creates the session row.
+		return func() tea.Msg {
+			return util.NewInfoMsg(fmt.Sprintf("Agent → %s", name))
+		}
+	}
+	sessionID := m.session.ID
 	return func() tea.Msg {
 		queued, err := m.com.Workspace.SetCurrentAgent(context.Background(), sessionID, agentID)
 		if err != nil {
-			// Revert optimistic update on failure.
 			m.currentAgentID = prev
 			return util.ReportError(fmt.Errorf("failed to switch agent: %w", err))()
 		}
@@ -1813,6 +1814,22 @@ func (m *UI) setAgent(agentID string) tea.Cmd {
 			return util.ReportWarn(fmt.Sprintf("Agent is busy — %s applies on next turn.", name))()
 		}
 		return util.NewInfoMsg(fmt.Sprintf("Agent → %s", name))
+	}
+}
+
+// persistLandingAgentSelection writes the pre-session agent choice onto
+// the freshly created session row. No-op when the user hasn't picked
+// anything or picked the default (coder) — the coordinator's coder
+// fallback covers both cases without a DB round-trip.
+//
+// Called from sendMessage and runShellCommandInternal right after
+// CreateSession returns.
+func (m *UI) persistLandingAgentSelection(sessionID string) {
+	if m.currentAgentID == "" || m.currentAgentID == config.AgentCoder {
+		return
+	}
+	if _, err := m.com.Workspace.SetCurrentAgent(context.Background(), sessionID, m.currentAgentID); err != nil {
+		slog.Warn("failed to persist landing-page agent selection", "err", err, "agent", m.currentAgentID)
 	}
 }
 
@@ -4425,13 +4442,10 @@ const (
 )
 
 // renderAgentHeader returns the single-line mini header that sits just
-// above the input, opencode-style: `▪ Plan · Claude Opus 4.7`. Returns
-// an empty string when there is no active agent to display (e.g. the
-// landing page, or before a session is opened).
+// above the input, opencode-style: `▪ Plan · Claude Opus 4.7`. Renders on
+// the landing page too so users can see (and change with Tab) which
+// agent will handle their first message.
 func (m *UI) renderAgentHeader(width int) string {
-	if !m.hasSession() {
-		return ""
-	}
 	name := m.agentDisplayName()
 	if name == "" {
 		return ""
@@ -4449,15 +4463,17 @@ func (m *UI) renderAgentHeader(width int) string {
 }
 
 // renderBorderedInput wraps the textarea view in a lipgloss style with a
-// single-column agent-colored bar on the left. This is what makes the
-// input visually pop the moment the user switches agents.
+// single-column agent-colored bar on the left. Renders even without a
+// session so the pre-first-message state visually reflects which agent
+// will pick up the prompt.
 func (m *UI) renderBorderedInput(view string, width int) string {
-	if !m.hasSession() {
+	// Only skip when we truly have no primary agents (misconfigured
+	// config), otherwise render the coder-color border on landing so
+	// users see the visual before typing.
+	if len(m.com.Workspace.ListPrimaryAgents()) == 0 {
 		return view
 	}
 	color := m.com.Styles.AgentColor(m.agentColorSpec())
-	// Draw only the left border to keep the vertical bar look. Padding
-	// leaves the input content readable.
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderLeft(true).
@@ -4470,28 +4486,43 @@ func (m *UI) renderBorderedInput(view string, width int) string {
 }
 
 // agentDisplayName returns the human-friendly name of the currently
-// selected primary agent, or empty when nothing is selectable.
+// selected primary agent. Falls back to the first primary agent (coder,
+// per PrimaryAgents sort order) when nothing has been explicitly
+// selected — so the landing page reads "Coder" instead of blank.
 func (m *UI) agentDisplayName() string {
-	if m.currentAgentID == "" {
+	agents := m.com.Workspace.ListPrimaryAgents()
+	if len(agents) == 0 {
 		return ""
 	}
-	for _, a := range m.com.Workspace.ListPrimaryAgents() {
-		if a.ID == m.currentAgentID {
+	id := m.currentAgentID
+	if id == "" {
+		return agents[0].Name
+	}
+	for _, a := range agents {
+		if a.ID == id {
 			return a.Name
 		}
 	}
-	return m.currentAgentID
+	return id
 }
 
 // agentColorSpec returns the raw color spec (keyword or hex) for the
-// currently selected primary agent, or "primary" when we can't resolve
-// one.
+// currently selected primary agent, falling back to the first primary
+// (coder) when nothing has been explicitly selected.
 func (m *UI) agentColorSpec() string {
-	if m.currentAgentID == "" {
+	agents := m.com.Workspace.ListPrimaryAgents()
+	if len(agents) == 0 {
 		return "primary"
 	}
-	for _, a := range m.com.Workspace.ListPrimaryAgents() {
-		if a.ID == m.currentAgentID {
+	id := m.currentAgentID
+	if id == "" {
+		if agents[0].Color == "" {
+			return "primary"
+		}
+		return agents[0].Color
+	}
+	for _, a := range agents {
+		if a.ID == id {
 			if a.Color == "" {
 				return "primary"
 			}
@@ -4611,6 +4642,7 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		}
 		if newSession.ID != "" {
 			m.session = &newSession
+			m.persistLandingAgentSelection(newSession.ID)
 			cmds = append(cmds, m.loadSession(newSession.ID))
 		}
 		m.setState(uiChat, m.focus)
@@ -4674,6 +4706,7 @@ func (m *UI) runShellCommandInternal(command string, isFirstMessage bool) tea.Cm
 		}
 		if newSession.ID != "" {
 			m.session = &newSession
+			m.persistLandingAgentSelection(newSession.ID)
 			cmds = append(cmds, m.loadSession(newSession.ID))
 		}
 		m.setState(uiChat, m.focus)
