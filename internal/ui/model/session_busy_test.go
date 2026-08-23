@@ -106,6 +106,14 @@ func (w *countingWorkspace) ListUserMessages(context.Context, string) ([]message
 
 func (w *countingWorkspace) WorkingDir() string { return "" }
 
+func (w *countingWorkspace) ListPrimaryAgents() []workspace.AgentInfo { return nil }
+
+func (w *countingWorkspace) CurrentAgent(context.Context, string) string { return "" }
+
+func (w *countingWorkspace) SetCurrentAgent(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
 func (w *countingWorkspace) LSPStart(context.Context, string) {}
 
 func (w *countingWorkspace) Config() *config.Config { return nil }

@@ -1054,5 +1054,16 @@ func quickStyle(o quickStyleOpts) Styles {
 	s.Pills.HelpText = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
 	s.Pills.Area = base
 
+	// Expose semantic palette colors so per-agent tinting (and any future
+	// consumer that needs "warning" or "primary" at render time) can look
+	// them up without hardcoding hex values.
+	s.Palette.Primary = o.primary
+	s.Palette.Secondary = o.secondary
+	s.Palette.Accent = o.accent
+	s.Palette.Success = o.success
+	s.Palette.Warning = o.warning
+	s.Palette.Error = o.error
+	s.Palette.Info = o.info
+
 	return s
 }

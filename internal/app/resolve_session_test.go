@@ -72,6 +72,10 @@ func (m *mockSessionService) Delete(context.Context, string) error {
 	return nil
 }
 
+func (m *mockSessionService) SetCurrentAgent(context.Context, string, string) error {
+	return nil
+}
+
 func (m *mockSessionService) CreateAgentToolSessionID(messageID, toolCallID string) string {
 	return fmt.Sprintf("%s$$%s", messageID, toolCallID)
 }

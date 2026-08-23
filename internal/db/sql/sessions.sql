@@ -48,7 +48,8 @@ SET
     completion_tokens = ?,
     summary_message_id = ?,
     cost = ?,
-    todos = ?
+    todos = ?,
+    current_agent_id = ?
 WHERE id = ?
 RETURNING *;
 
@@ -71,4 +72,9 @@ WHERE id = ?;
 
 -- name: DeleteSession :exec
 DELETE FROM sessions
+WHERE id = ?;
+
+-- name: SetSessionCurrentAgent :exec
+UPDATE sessions
+SET current_agent_id = ?
 WHERE id = ?;

@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/google/uuid"
@@ -82,6 +83,12 @@ func (s *runCoordinator) Summarize(context.Context, string) error {
 func (s *runCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (s *runCoordinator) UpdateModels(context.Context) error            { return nil }
 func (s *runCoordinator) GenerateTitle(context.Context, string, string) {}
+
+func (s *runCoordinator) PrimaryAgents() []config.Agent                   { return nil }
+func (s *runCoordinator) CurrentPrimary(context.Context, string) string   { return "" }
+func (s *runCoordinator) SetCurrentPrimary(context.Context, string, string) (bool, error) {
+	return false, nil
+}
 
 func (s *runCoordinator) capturedCtx() context.Context {
 	s.mu.Lock()

@@ -110,6 +110,16 @@ type AgentModel struct {
 	ModelCfg   config.SelectedModel
 }
 
+// AgentInfo is the UI-facing projection of a primary agent — everything the
+// prompt bar, palette, and sidebar need to render mode-switching without
+// leaking config internals.
+type AgentInfo struct {
+	ID          string
+	Name        string
+	Description string
+	Color       string // theme keyword (primary, warning, error, ...) or "#RRGGBB"
+}
+
 // Workspace is the main abstraction consumed by the TUI and CLI. It
 // groups every operation a frontend needs to perform against a running
 // workspace, regardless of whether the workspace is in-process or
@@ -151,6 +161,19 @@ type Workspace interface {
 	AgentIsSessionBusy(sessionID string) bool
 	AgentModel() AgentModel
 	AgentIsReady() bool
+	// ListPrimaryAgents returns the cycleable primary agents in Tab order
+	// (coder first). Powers the /agent palette and the Tab-cycle UI.
+	ListPrimaryAgents() []AgentInfo
+	// CurrentAgent returns the agent id currently selected for the given
+	// session. Falls back to the coder default when the session is
+	// unknown or has no selection persisted.
+	CurrentAgent(ctx context.Context, sessionID string) string
+	// SetCurrentAgent persists the user-facing agent choice on the session
+	// row. Returns queued=true when the session is currently busy — the
+	// switch still lands, it just applies on the next Run instead of the
+	// one in flight. Remote-mode implementations may return an error
+	// until the HTTP route is wired.
+	SetCurrentAgent(ctx context.Context, sessionID, agentID string) (queued bool, err error)
 	// AgentReadyErr reports nil when the coder agent is ready to accept
 	// work, or a descriptive error otherwise: ErrAgentNotInitialized
 	// when the agent simply isn't set up, or ErrServerUnreachable

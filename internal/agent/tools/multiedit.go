@@ -77,6 +77,10 @@ func NewMultiEditTool(
 
 			params.FilePath = filepathext.SmartJoin(workingDir, params.FilePath)
 
+			if resp, deny := EnforceWriteAllowlist(ctx, workingDir, params.FilePath); deny {
+				return resp, nil
+			}
+
 			// Validate all edits before applying any
 			if err := validateEdits(params.Edits); err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil

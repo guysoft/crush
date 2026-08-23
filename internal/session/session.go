@@ -58,8 +58,13 @@ type Session struct {
 	SummaryMessageID string
 	Cost             float64
 	Todos            []Todo
-	CreatedAt        int64
-	UpdatedAt        int64
+	// CurrentAgentID persists the primary agent (coder / plan / ...) the
+	// user last had selected in this session. Empty means "use the
+	// coordinator default" and preserves back-compat with pre-agent-cycle
+	// sessions.
+	CurrentAgentID string
+	CreatedAt      int64
+	UpdatedAt      int64
 }
 
 type Service interface {
@@ -74,6 +79,9 @@ type Service interface {
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
 	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
+	// SetCurrentAgent persists the current primary agent selection on the
+	// session row. Passing "" clears it.
+	SetCurrentAgent(ctx context.Context, sessionID, agentID string) error
 
 	// Agent tool session management
 	CreateAgentToolSessionID(messageID, toolCallID string) string
@@ -208,6 +216,10 @@ func (s *service) Save(ctx context.Context, session Session) (Session, error) {
 			String: todosJSON,
 			Valid:  todosJSON != "",
 		},
+		CurrentAgentID: sql.NullString{
+			String: session.CurrentAgentID,
+			Valid:  session.CurrentAgentID != "",
+		},
 	})
 	if err != nil {
 		return Session{}, err
@@ -246,6 +258,23 @@ func (s *service) Rename(ctx context.Context, id string, title string) error {
 		return err
 	}
 	s.publishSessionUpdate(ctx, id)
+	return nil
+}
+
+// SetCurrentAgent persists the current primary agent selection on the
+// session row and publishes an update event so UIs re-render. Passing
+// "" clears the field.
+func (s *service) SetCurrentAgent(ctx context.Context, sessionID, agentID string) error {
+	if err := s.q.SetSessionCurrentAgent(ctx, db.SetSessionCurrentAgentParams{
+		ID: sessionID,
+		CurrentAgentID: sql.NullString{
+			String: agentID,
+			Valid:  agentID != "",
+		},
+	}); err != nil {
+		return err
+	}
+	s.publishSessionUpdate(ctx, sessionID)
 	return nil
 }
 
@@ -310,6 +339,7 @@ func (s *service) fromDBItem(item db.Session) Session {
 		SummaryMessageID: item.SummaryMessageID.String,
 		Cost:             item.Cost,
 		Todos:            todos,
+		CurrentAgentID:   item.CurrentAgentID.String,
 		CreatedAt:        item.CreatedAt,
 		UpdatedAt:        item.UpdatedAt,
 	}

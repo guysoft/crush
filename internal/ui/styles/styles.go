@@ -590,6 +590,20 @@ type Styles struct {
 		HelpText           lipgloss.Style // Help action text style
 		Area               lipgloss.Style // Pills area container
 	}
+
+	// Palette exposes the theme's semantic base colors so consumers that
+	// need to reference a "warning" or "primary" color at render time
+	// (e.g. per-agent tinting) can do so without hardcoding a hex or
+	// re-walking pre-baked style fields. Populated by quickStyle.
+	Palette struct {
+		Primary   color.Color
+		Secondary color.Color
+		Accent    color.Color
+		Success   color.Color
+		Warning   color.Color
+		Error     color.Color
+		Info      color.Color
+	}
 }
 
 // ChromaTheme converts the current markdown chroma styles to a chroma
@@ -679,4 +693,32 @@ func chromaStyle(style ansi.StylePrimitive) string {
 	}
 
 	return s.String()
+}
+
+// AgentColor resolves a config.Agent.Color value ("primary", "warning",
+// "#RRGGBB", …) against the theme's Palette. Returns Palette.Primary for
+// the empty string or any unknown keyword so callers never render with a
+// zero-value color.
+func (s *Styles) AgentColor(spec string) color.Color {
+	spec = strings.TrimSpace(spec)
+	if strings.HasPrefix(spec, "#") {
+		return lipgloss.Color(spec)
+	}
+	switch strings.ToLower(spec) {
+	case "primary", "":
+		return s.Palette.Primary
+	case "secondary":
+		return s.Palette.Secondary
+	case "accent":
+		return s.Palette.Accent
+	case "success":
+		return s.Palette.Success
+	case "warning":
+		return s.Palette.Warning
+	case "error":
+		return s.Palette.Error
+	case "info":
+		return s.Palette.Info
+	}
+	return s.Palette.Primary
 }

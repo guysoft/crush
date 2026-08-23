@@ -68,6 +68,7 @@ type KeyMap struct {
 	Suspend    key.Binding
 	Sessions   key.Binding
 	Tab        key.Binding
+	AgentCycle key.Binding
 	ToggleYolo key.Binding
 }
 
@@ -98,8 +99,12 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("ctrl+s", "sessions"),
 		),
 		Tab: key.NewBinding(
+			key.WithKeys("shift+tab"),
+			key.WithHelp("shift+tab", "change focus"),
+		),
+		AgentCycle: key.NewBinding(
 			key.WithKeys("tab"),
-			key.WithHelp("tab", "change focus"),
+			key.WithHelp("tab", "cycle agent"),
 		),
 		ToggleYolo: key.NewBinding(
 			key.WithKeys("ctrl+y"),
@@ -170,8 +175,8 @@ func DefaultKeyMap() KeyMap {
 		key.WithHelp("esc", "cancel"),
 	)
 	km.Chat.Tab = key.NewBinding(
-		key.WithKeys("tab"),
-		key.WithHelp("tab", "change focus"),
+		key.WithKeys("shift+tab"),
+		key.WithHelp("shift+tab", "change focus"),
 	)
 	km.Chat.Details = key.NewBinding(
 		key.WithKeys("ctrl+d"),

@@ -407,6 +407,12 @@ type UI struct {
 	// handleUndoCommand / handleRedoCommand / redoStackReset.
 	redoStack []string
 	redoDir   string
+
+	// currentAgentID is the primary-agent id the user has selected for
+	// the current session. Mirrors what would be re-read from the
+	// session row on load; kept on-model so the visual (border, header,
+	// sidebar) does not have to hit the DB on every render.
+	currentAgentID string
 }
 
 // New creates a new instance of the [UI] model.
@@ -775,6 +781,10 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Session switch: redo history is session-scoped. Any pending
 		// /redo frames belong to whatever we were just looking at.
 		m.redoStackReset()
+		// Session switch: pick up the persisted agent selection for
+		// this session so Tab cycles start from the right place and
+		// the color/header visuals reflect reality.
+		m.currentAgentID = m.com.Workspace.CurrentAgent(context.Background(), msg.session.ID)
 		// Session switch: the memoized busy state and queued prompts
 		// belong to the previous session. Drop them and re-fetch
 		// off-thread so the queue pill and esc behavior track the new
@@ -1736,6 +1746,76 @@ func (m *UI) handleRedoCommand(path string) tea.Cmd {
 	}
 }
 
+// cycleAgent moves the primary agent selection forward (direction=+1) or
+// backward (direction=-1) through Workspace.ListPrimaryAgents. Wraps around.
+// If no session is active it warns and does nothing — persistence requires
+// a session row to write to.
+func (m *UI) cycleAgent(direction int) tea.Cmd {
+	if direction == 0 {
+		direction = 1
+	}
+	if !m.hasSession() {
+		return util.ReportWarn("Start a session first — the agent choice is saved per session.")
+	}
+	agents := m.com.Workspace.ListPrimaryAgents()
+	if len(agents) == 0 {
+		return util.ReportWarn("No primary agents configured.")
+	}
+	cur := m.currentAgentID
+	if cur == "" {
+		cur = agents[0].ID
+	}
+	idx := 0
+	for i, a := range agents {
+		if a.ID == cur {
+			idx = i
+			break
+		}
+	}
+	next := (idx + direction) % len(agents)
+	if next < 0 {
+		next += len(agents)
+	}
+	return m.setAgent(agents[next].ID)
+}
+
+// setAgent persists a new primary-agent selection on the current session
+// and updates the on-model mirror so the visual reflects it immediately.
+// If a run is already in flight for this session the workspace call
+// returns queued=true and we warn the user that the change takes effect
+// on the next turn.
+func (m *UI) setAgent(agentID string) tea.Cmd {
+	if !m.hasSession() {
+		return util.ReportWarn("Start a session first — the agent choice is saved per session.")
+	}
+	sessionID := m.session.ID
+	// Optimistic update — flip the local state right away so the visual
+	// tracks the keypress even if the workspace write takes a moment.
+	// If the write fails we revert below.
+	prev := m.currentAgentID
+	m.currentAgentID = agentID
+	agents := m.com.Workspace.ListPrimaryAgents()
+	name := agentID
+	for _, a := range agents {
+		if a.ID == agentID {
+			name = a.Name
+			break
+		}
+	}
+	return func() tea.Msg {
+		queued, err := m.com.Workspace.SetCurrentAgent(context.Background(), sessionID, agentID)
+		if err != nil {
+			// Revert optimistic update on failure.
+			m.currentAgentID = prev
+			return util.ReportError(fmt.Errorf("failed to switch agent: %w", err))()
+		}
+		if queued {
+			return util.ReportWarn(fmt.Sprintf("Agent is busy — %s applies on next turn.", name))()
+		}
+		return util.NewInfoMsg(fmt.Sprintf("Agent → %s", name))
+	}
+}
+
 // loadNestedToolCalls recursively loads nested tool calls for agent/agentic_fetch tools.
 func (m *UI) loadNestedToolCalls(items []chat.MessageItem) {
 	for _, item := range items {
@@ -2182,6 +2262,16 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		path := m.redoStack[last]
 		m.redoStack = m.redoStack[:last]
 		cmds = append(cmds, m.handleRedoCommand(path))
+		m.dialog.CloseDialog(dialog.CommandsID)
+	case dialog.ActionCycleAgent:
+		if cmd := m.cycleAgent(msg.Direction); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		m.dialog.CloseDialog(dialog.CommandsID)
+	case dialog.ActionSetAgent:
+		if cmd := m.setAgent(msg.AgentID); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionToggleHelp:
 		m.status.ToggleHelp()
@@ -2676,6 +2766,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			return true
 		case key.Matches(msg, m.keyMap.Sessions):
 			if cmd := m.openSessionsDialog(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return true
+		case key.Matches(msg, m.keyMap.AgentCycle):
+			if cmd := m.cycleAgent(1); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
 			return true
@@ -3333,8 +3428,10 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 
 		if m.textarea.Focused() {
 			cur := m.textarea.Cursor()
-			cur.X++                            // Adjust for app margins
-			cur.Y += m.layout.editor.Min.Y + 1 // Offset for attachments row
+			// Offsets defined by renderEditorView's layout. Do NOT
+			// hand-tune these here — bump editorCursorDX / editorCursorDY.
+			cur.X += editorCursorDX
+			cur.Y += m.layout.editor.Min.Y + editorCursorDY
 			return cur
 		}
 	}
@@ -4209,9 +4306,10 @@ func (m *UI) completionsPosition() image.Point {
 			Y: m.layout.editor.Min.Y,
 		}
 	}
+	// Same layout as the terminal cursor — see editorCursorDX / DY.
 	return image.Point{
-		X: cur.X + m.layout.editor.Min.X,
-		Y: m.layout.editor.Min.Y + cur.Y,
+		X: cur.X + m.layout.editor.Min.X + editorCursorDX,
+		Y: cur.Y + m.layout.editor.Min.Y + editorCursorDY,
 	}
 }
 
@@ -4278,16 +4376,139 @@ func (m *UI) randomizePlaceholders() {
 }
 
 // renderEditorView renders the editor view with attachments if any.
+//
+// Layout invariant (relied on by editorCursorOffset for cursor screen
+// placement):
+//
+//   row 0: attachments  (blank string when none — keeps the row present)
+//   row 1: agent header (blank string only when no primaries configured)
+//   row 2: bordered textarea (starts here — see editorCursorOffset dy)
+//   row 3: bottom margin
+//
+// Do NOT switch to conditional row emission: cursor Y is offset by a
+// constant `editorCursorDY` derived from this shape.
 func (m *UI) renderEditorView(width int) string {
 	var attachmentsView string
 	if len(m.attachments.List()) > 0 {
 		attachmentsView = m.attachments.Render(width)
 	}
+
+	// Compose the agent-scoped visual: mini header above the textarea
+	// and an agent-colored left border down the input. This is what
+	// makes plan-mode read visually distinct from build/coder mode.
+	header := m.renderAgentHeader(width)
+	borderedInput := m.renderBorderedInput(m.textarea.View(), width)
+
 	return strings.Join([]string{
 		attachmentsView,
-		m.textarea.View(),
-		"", // margin at bottom of editor
+		header,
+		borderedInput,
+		"", // bottom margin
 	}, "\n")
+}
+
+// editorCursorDX / editorCursorDY are the constant offsets from the
+// textarea's own (0, 0) origin to its screen-space position inside the
+// editor layout region:
+//
+//   dx = 1 (app left margin) + 1 (agent-color border column) + 1 (left padding)
+//   dy = 1 (attachments row)  + 1 (agent header row)
+//
+// See renderEditorView for the layout the constants encode. Consumers:
+// the terminal-cursor return in handleKeyPressMsg and completionsPosition
+// (autocomplete popup placement). Any change to renderEditorView's row
+// order or renderBorderedInput's border/padding shape must update these
+// in the same edit.
+const (
+	editorCursorDX = 3
+	editorCursorDY = 2
+)
+
+// renderAgentHeader returns the single-line mini header that sits just
+// above the input, opencode-style: `▪ Plan · Claude Opus 4.7`. Returns
+// an empty string when there is no active agent to display (e.g. the
+// landing page, or before a session is opened).
+func (m *UI) renderAgentHeader(width int) string {
+	if !m.hasSession() {
+		return ""
+	}
+	name := m.agentDisplayName()
+	if name == "" {
+		return ""
+	}
+	color := m.com.Styles.AgentColor(m.agentColorSpec())
+	square := lipgloss.NewStyle().Foreground(color).Render("▪")
+	nameStyled := lipgloss.NewStyle().Foreground(color).Bold(true).Render(name)
+	sep := lipgloss.NewStyle().Foreground(m.com.Styles.Palette.Info).Render(" · ")
+	modelName := m.agentModelDisplayName()
+	if modelName == "" {
+		return " " + square + " " + nameStyled
+	}
+	modelStyled := lipgloss.NewStyle().Foreground(m.com.Styles.Palette.Info).Render(modelName)
+	return " " + square + " " + nameStyled + sep + modelStyled
+}
+
+// renderBorderedInput wraps the textarea view in a lipgloss style with a
+// single-column agent-colored bar on the left. This is what makes the
+// input visually pop the moment the user switches agents.
+func (m *UI) renderBorderedInput(view string, width int) string {
+	if !m.hasSession() {
+		return view
+	}
+	color := m.com.Styles.AgentColor(m.agentColorSpec())
+	// Draw only the left border to keep the vertical bar look. Padding
+	// leaves the input content readable.
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderLeft(true).
+		BorderTop(false).
+		BorderRight(false).
+		BorderBottom(false).
+		BorderForeground(color).
+		PaddingLeft(1).
+		Render(view)
+}
+
+// agentDisplayName returns the human-friendly name of the currently
+// selected primary agent, or empty when nothing is selectable.
+func (m *UI) agentDisplayName() string {
+	if m.currentAgentID == "" {
+		return ""
+	}
+	for _, a := range m.com.Workspace.ListPrimaryAgents() {
+		if a.ID == m.currentAgentID {
+			return a.Name
+		}
+	}
+	return m.currentAgentID
+}
+
+// agentColorSpec returns the raw color spec (keyword or hex) for the
+// currently selected primary agent, or "primary" when we can't resolve
+// one.
+func (m *UI) agentColorSpec() string {
+	if m.currentAgentID == "" {
+		return "primary"
+	}
+	for _, a := range m.com.Workspace.ListPrimaryAgents() {
+		if a.ID == m.currentAgentID {
+			if a.Color == "" {
+				return "primary"
+			}
+			return a.Color
+		}
+	}
+	return "primary"
+}
+
+// agentModelDisplayName returns the model name the coordinator will use
+// for the next run — sourced from the same AgentModel the sidebar uses.
+func (m *UI) agentModelDisplayName() string {
+	model := m.selectedLargeModel()
+	if model == nil {
+		return ""
+	}
+	return model.CatwalkCfg.Name
 }
 
 // cacheSidebarLogo renders and caches the sidebar logo at the specified width.
@@ -4981,6 +5202,8 @@ func (m *UI) newSession() tea.Cmd {
 	m.sessionFileReads = nil
 	// New session drops any pending /redo history from the previous one.
 	m.redoStackReset()
+	// New session resets the agent picker back to the default (coder).
+	m.currentAgentID = ""
 	m.setState(uiLanding, uiFocusEditor)
 	m.textarea.Focus()
 	m.chat.Blur()

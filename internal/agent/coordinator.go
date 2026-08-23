@@ -109,6 +109,20 @@ type Coordinator interface {
 	Model() Model
 	UpdateModels(ctx context.Context) error
 	GenerateTitle(ctx context.Context, sessionID, prompt string)
+
+	// PrimaryAgents lists the user-facing agents (config.AgentModePrimary),
+	// in a stable cycle order (coder first, others alphabetical). Powers
+	// the Tab-cycle and the /agent palette entries.
+	PrimaryAgents() []config.Agent
+	// CurrentPrimary returns the primary agent id currently in effect for
+	// the given session. Reads from the session row's CurrentAgentID; if
+	// unset or unknown, falls back to config.AgentCoder.
+	CurrentPrimary(ctx context.Context, sessionID string) string
+	// SetCurrentPrimary persists the chosen primary agent on the session
+	// row. Returns queued=true if the session is currently busy (the
+	// change will only take effect on the next Run). Returns an error if
+	// agentID is not a known primary agent.
+	SetCurrentPrimary(ctx context.Context, sessionID, agentID string) (queued bool, err error)
 }
 
 type coordinator struct {
@@ -190,18 +204,42 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		return nil, errCoderAgentNotConfigured
 	}
 
-	// TODO: make this dynamic when we support multiple agents
-	prompt, err := coderPrompt(prompt.WithWorkingDir(c.cfg.WorkingDir()))
+	// Build the default (coder) agent first. Its SessionAgent handle is
+	// what BeginAccepted, IsSessionBusy, IsBusy, and Model() operate on —
+	// everything that isn't scoped to a specific per-turn run.
+	coderPromptTpl, err := coderPrompt(prompt.WithWorkingDir(c.cfg.WorkingDir()))
 	if err != nil {
 		return nil, err
 	}
-
-	agent, err := c.buildAgent(ctx, prompt, agentCfg, false)
+	agent, err := c.buildAgent(ctx, coderPromptTpl, agentCfg, false)
 	if err != nil {
 		return nil, err
 	}
 	c.currentAgent = agent
 	c.agents[config.AgentCoder] = agent
+
+	// Build every additional primary agent registered in config. Each
+	// gets its own SessionAgent (own tools, own prompt suffix) so the
+	// coordinator can hand-pick which one to hand the ctx to at Run time
+	// based on the session's persisted CurrentAgentID.
+	for id, acfg := range opts.Config.Config().Agents {
+		if id == config.AgentCoder {
+			continue
+		}
+		if acfg.Mode != config.AgentModePrimary {
+			continue
+		}
+		p, err := agentPrompt(acfg, prompt.WithWorkingDir(c.cfg.WorkingDir()))
+		if err != nil {
+			return nil, fmt.Errorf("build prompt for agent %s: %w", id, err)
+		}
+		a, err := c.buildAgent(ctx, p, acfg, false)
+		if err != nil {
+			return nil, fmt.Errorf("build agent %s: %w", id, err)
+		}
+		c.agents[id] = a
+	}
+
 	return c, nil
 }
 
@@ -250,7 +288,24 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 		return nil, fmt.Errorf("failed to update models: %w", err)
 	}
 
-	model := c.currentAgent.Model()
+	// Resolve which primary agent should handle this turn. The
+	// session's CurrentAgentID is the persisted user choice (Tab /
+	// palette). Empty or unknown → fall back to coder.
+	acting, actingCfg := c.resolvePrimary(ctx, sessionID)
+	// Stamp the acting agent identity + write allowlist onto ctx so
+	// write-capable tools (write, edit, multiedit) can enforce the
+	// per-agent path policy.
+	ctx = context.WithValue(ctx, tools.AgentIDContextKey, actingCfg.ID)
+	// nil vs empty vs populated all mean different things —
+	// EnforceWriteAllowlist reads WriteAllowlistContextKey via
+	// GetWriteAllowlistFromContext to distinguish. Only stamp when the
+	// agent has a policy set; leaving ctx untouched means "no
+	// restriction", which is coder's default.
+	if actingCfg.WritePathAllowlist != nil {
+		ctx = context.WithValue(ctx, tools.WriteAllowlistContextKey, actingCfg.WritePathAllowlist)
+	}
+
+	model := acting.Model()
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
 		maxTokens = model.ModelCfg.MaxTokens
@@ -294,7 +349,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// same correlator.
 	runID := RunIDFromContext(ctx)
 	run := func() (*fantasy.AgentResult, error) {
-		return c.currentAgent.Run(ctx, SessionAgentCall{
+		return acting.Run(ctx, SessionAgentCall{
 			SessionID:        sessionID,
 			RunID:            runID,
 			Prompt:           prompt,
@@ -1182,23 +1237,42 @@ func (c *coordinator) BeginAccepted(sessionID string) *AcceptedRun {
 }
 
 func (c *coordinator) Cancel(sessionID string) {
-	c.currentAgent.Cancel(sessionID)
+	// Any of the primary agents could be running this session; fan out
+	// so we don't leak an in-flight run when the user switches agents
+	// between turns.
+	for _, a := range c.agents {
+		a.Cancel(sessionID)
+	}
 }
 
 func (c *coordinator) CancelAll() {
-	c.currentAgent.CancelAll()
+	for _, a := range c.agents {
+		a.CancelAll()
+	}
 }
 
 func (c *coordinator) ClearQueue(sessionID string) {
-	c.currentAgent.ClearQueue(sessionID)
+	for _, a := range c.agents {
+		a.ClearQueue(sessionID)
+	}
 }
 
 func (c *coordinator) IsBusy() bool {
-	return c.currentAgent.IsBusy()
+	for _, a := range c.agents {
+		if a.IsBusy() {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *coordinator) IsSessionBusy(sessionID string) bool {
-	return c.currentAgent.IsSessionBusy(sessionID)
+	for _, a := range c.agents {
+		if a.IsSessionBusy(sessionID) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *coordinator) Model() Model {
@@ -1618,3 +1692,88 @@ func logDiscoveryStats(
 		"active_names", activeNames,
 	)
 }
+
+// resolvePrimary looks up the acting agent + config for a given session,
+// preferring the session's persisted CurrentAgentID and falling back to
+// coder if unset, unknown, or on any DB error.
+func (c *coordinator) resolvePrimary(ctx context.Context, sessionID string) (SessionAgent, config.Agent) {
+	id := c.CurrentPrimary(ctx, sessionID)
+	acting, ok := c.agents[id]
+	if !ok {
+		acting = c.currentAgent
+		id = config.AgentCoder
+	}
+	agentCfg, ok := c.cfg.Config().Agents[id]
+	if !ok {
+		agentCfg = c.cfg.Config().Agents[config.AgentCoder]
+	}
+	return acting, agentCfg
+}
+
+// PrimaryAgents implements Coordinator.
+func (c *coordinator) PrimaryAgents() []config.Agent {
+	cfgAgents := c.cfg.Config().Agents
+	var list []config.Agent
+	for _, a := range cfgAgents {
+		if a.Mode != config.AgentModePrimary {
+			continue
+		}
+		if a.Disabled {
+			continue
+		}
+		list = append(list, a)
+	}
+	// Coder first, then alphabetical. Stable order matters because Tab
+	// cycles through this exact list.
+	slices.SortFunc(list, func(a, b config.Agent) int {
+		if a.ID == config.AgentCoder && b.ID != config.AgentCoder {
+			return -1
+		}
+		if b.ID == config.AgentCoder && a.ID != config.AgentCoder {
+			return 1
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return list
+}
+
+// CurrentPrimary implements Coordinator.
+func (c *coordinator) CurrentPrimary(ctx context.Context, sessionID string) string {
+	if sessionID == "" {
+		return config.AgentCoder
+	}
+	s, err := c.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return config.AgentCoder
+	}
+	if s.CurrentAgentID == "" {
+		return config.AgentCoder
+	}
+	if _, ok := c.agents[s.CurrentAgentID]; !ok {
+		return config.AgentCoder
+	}
+	return s.CurrentAgentID
+}
+
+// SetCurrentPrimary implements Coordinator. Persists to the session row
+// (which is the source of truth). If the session is currently busy the
+// write still lands — the queue semantics come from the run() reading the
+// session fresh on entry.
+func (c *coordinator) SetCurrentPrimary(ctx context.Context, sessionID, agentID string) (bool, error) {
+	if sessionID == "" {
+		return false, errors.New("session id required")
+	}
+	if _, ok := c.agents[agentID]; !ok {
+		return false, fmt.Errorf("unknown agent %q", agentID)
+	}
+	agentCfg := c.cfg.Config().Agents[agentID]
+	if agentCfg.Mode != config.AgentModePrimary {
+		return false, fmt.Errorf("agent %q is not a primary agent", agentID)
+	}
+	if err := c.sessions.SetCurrentAgent(ctx, sessionID, agentID); err != nil {
+		return false, err
+	}
+	return c.IsSessionBusy(sessionID), nil
+}
+
+

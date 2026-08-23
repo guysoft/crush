@@ -284,6 +284,21 @@ func (w *ClientWorkspace) AgentIsReady() bool {
 	return w.AgentReadyErr() == nil
 }
 
+// ponytail: local-only. Upgrade path mirrors DeleteMessagesAfter — add
+// HTTP endpoints for listing agents and setting current agent when
+// someone actually attaches a remote TUI.
+func (w *ClientWorkspace) ListPrimaryAgents() []AgentInfo {
+	return nil
+}
+
+func (w *ClientWorkspace) CurrentAgent(_ context.Context, _ string) string {
+	return ""
+}
+
+func (w *ClientWorkspace) SetCurrentAgent(_ context.Context, _, _ string) (bool, error) {
+	return false, errors.New("agent switching not supported in remote (client/server) mode")
+}
+
 func (w *ClientWorkspace) AgentReadyErr() error {
 	info, err := w.client.GetAgentInfo(context.Background(), w.workspaceID())
 	if err != nil {

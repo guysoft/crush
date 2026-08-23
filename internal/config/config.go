@@ -57,8 +57,19 @@ const (
 )
 
 const (
-	AgentCoder string = "coder"
-	AgentTask  string = "task"
+	AgentCoder         string = "coder"
+	AgentPlan          string = "plan"
+	AgentPlanReadOnly  string = "plan-read-only"
+	AgentTask          string = "task"
+)
+
+// AgentModePrimary is the mode value for user-facing agents cycled via Tab.
+// AgentModeSubagent is the mode value for agents invoked by other agents
+// (e.g. the task agent invoked via the agent tool). Only Primary agents
+// appear in the /agent cycle and command palette.
+const (
+	AgentModePrimary  string = "primary"
+	AgentModeSubagent string = "subagent"
 )
 
 type SelectedModel struct {
@@ -567,6 +578,27 @@ type Agent struct {
 
 	// Overrides the context paths for this agent
 	ContextPaths []string `json:"context_paths,omitempty"`
+
+	// Mode controls whether this agent is user-facing (primary, appears in
+	// the /agent cycle) or invoked by other agents (subagent). Defaults to
+	// primary for backwards compatibility.
+	Mode string `json:"mode,omitempty" jsonschema:"description=Agent mode: primary (Tab-cycleable) or subagent (invoked by other agents),enum=primary,enum=subagent,default=primary"`
+
+	// Color is used to tint the input border and agent name in the UI when
+	// this agent is active. Either a theme keyword (primary, warning, error,
+	// accent, success, info) or a hex string like "#e5b429".
+	Color string `json:"color,omitempty" jsonschema:"description=Color used to tint the UI while this agent is active. Theme keyword or #RRGGBB."`
+
+	// PromptSuffix is appended to the base system prompt whenever this
+	// agent is active. This is where mode-specific reminders (plan mode,
+	// read-only mode, ...) live.
+	PromptSuffix string `json:"prompt_suffix,omitempty"`
+
+	// WritePathAllowlist restricts file-writing tools (write, edit,
+	// multiedit) to targets matching one of these glob patterns. Empty
+	// slice means no writes at all; nil means no restriction. Applied at
+	// the tool boundary — see internal/agent/tools.enforceWriteAllowlist.
+	WritePathAllowlist []string `json:"write_path_allowlist,omitempty"`
 }
 
 type Tools struct {
@@ -846,6 +878,7 @@ func filterSlice(data []string, mask []string, include bool) []string {
 
 func (c *Config) SetupAgents() {
 	allowedTools := resolveAllowedTools(allToolNames(), c.Options.DisabledTools)
+	readOnlyTools := resolveReadOnlyTools(allowedTools)
 
 	agents := map[string]Agent{
 		AgentCoder: {
@@ -855,6 +888,36 @@ func (c *Config) SetupAgents() {
 			Model:        SelectedModelTypeLarge,
 			ContextPaths: c.Options.ContextPaths,
 			AllowedTools: allowedTools,
+			Mode:         AgentModePrimary,
+			Color:        "primary",
+		},
+
+		AgentPlan: {
+			ID:           AgentPlan,
+			Name:         "Plan",
+			Description:  "Read-only planning agent. Explores, designs, and writes a plan file to .crush/plans/*.md for the coder to execute.",
+			Model:        SelectedModelTypeLarge,
+			ContextPaths: c.Options.ContextPaths,
+			// Reads + writes; the write allowlist below constrains where
+			// writes actually land. This is the opencode-style plan agent.
+			AllowedTools:       allowedTools,
+			WritePathAllowlist: []string{".crush/plans/**"},
+			Mode:               AgentModePrimary,
+			Color:              "warning",
+		},
+
+		AgentPlanReadOnly: {
+			ID:           AgentPlanReadOnly,
+			Name:         "Plan (read-only)",
+			Description:  "Truly read-only planning agent. Explores and discusses; cannot write, edit, or run shell commands.",
+			Model:        SelectedModelTypeLarge,
+			ContextPaths: c.Options.ContextPaths,
+			AllowedTools: readOnlyTools,
+			// Empty (non-nil) allowlist == deny all writes; belt-and-braces
+			// alongside the tool whitelist.
+			WritePathAllowlist: []string{},
+			Mode:               AgentModePrimary,
+			Color:              "error",
 		},
 
 		AgentTask: {
@@ -863,9 +926,10 @@ func (c *Config) SetupAgents() {
 			Description:  "An agent that helps with searching for context and finding implementation details.",
 			Model:        SelectedModelTypeLarge,
 			ContextPaths: c.Options.ContextPaths,
-			AllowedTools: resolveReadOnlyTools(allowedTools),
+			AllowedTools: readOnlyTools,
 			// NO MCPs or LSPs by default
 			AllowedMCP: map[string][]string{},
+			Mode:       AgentModeSubagent,
 		},
 	}
 	c.Agents = agents

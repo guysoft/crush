@@ -207,6 +207,37 @@ func (w *AppWorkspace) AgentReadyErr() error {
 	return nil
 }
 
+func (w *AppWorkspace) ListPrimaryAgents() []AgentInfo {
+	if w.app.AgentCoordinator == nil {
+		return nil
+	}
+	agents := w.app.AgentCoordinator.PrimaryAgents()
+	out := make([]AgentInfo, 0, len(agents))
+	for _, a := range agents {
+		out = append(out, AgentInfo{
+			ID:          a.ID,
+			Name:        a.Name,
+			Description: a.Description,
+			Color:       a.Color,
+		})
+	}
+	return out
+}
+
+func (w *AppWorkspace) CurrentAgent(ctx context.Context, sessionID string) string {
+	if w.app.AgentCoordinator == nil {
+		return ""
+	}
+	return w.app.AgentCoordinator.CurrentPrimary(ctx, sessionID)
+}
+
+func (w *AppWorkspace) SetCurrentAgent(ctx context.Context, sessionID, agentID string) (bool, error) {
+	if w.app.AgentCoordinator == nil {
+		return false, ErrAgentNotInitialized
+	}
+	return w.app.AgentCoordinator.SetCurrentPrimary(ctx, sessionID, agentID)
+}
+
 func (w *AppWorkspace) AgentQueuedPrompts(sessionID string) int {
 	if w.app.AgentCoordinator == nil {
 		return 0

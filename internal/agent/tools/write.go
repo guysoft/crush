@@ -65,6 +65,10 @@ func NewWriteTool(
 
 			filePath := filepathext.SmartJoin(workingDir, params.FilePath)
 
+			if resp, deny := EnforceWriteAllowlist(ctx, workingDir, filePath); deny {
+				return resp, nil
+			}
+
 			fileInfo, err := os.Stat(filePath)
 			if err == nil {
 				if fileInfo.IsDir() {

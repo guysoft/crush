@@ -57,7 +57,28 @@ func (m *UI) modelInfo(width int) string {
 	if model != nil {
 		modelName = model.CatwalkCfg.Name
 	}
-	return common.ModelInfo(m.com.Styles, modelName, providerName, reasoningInfo, modelContext, width, m.hyperCredits)
+	block := common.ModelInfo(m.com.Styles, modelName, providerName, reasoningInfo, modelContext, width, m.hyperCredits)
+	if agentLine := m.agentSidebarLine(); agentLine != "" {
+		block = agentLine + "\n" + block
+	}
+	return block
+}
+
+// agentSidebarLine renders `▪ Plan` in the agent's color for the sidebar
+// slot above the model line. Empty when the user has no primary agent
+// selected (e.g. landing page).
+func (m *UI) agentSidebarLine() string {
+	if !m.hasSession() {
+		return ""
+	}
+	name := m.agentDisplayName()
+	if name == "" {
+		return ""
+	}
+	color := m.com.Styles.AgentColor(m.agentColorSpec())
+	square := lipgloss.NewStyle().Foreground(color).Render("▪")
+	label := lipgloss.NewStyle().Foreground(color).Bold(true).Render(name)
+	return square + " " + label
 }
 
 // updateSidebarScrollState renders the sidebar content and computes scroll

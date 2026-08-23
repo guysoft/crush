@@ -454,6 +454,11 @@ func (c *Commands) defaultCommands() []*CommandItem {
 	if c.hasSession {
 		commands = append(commands, NewCommandItem(c.com.Styles, "undo", "Undo Last Message", "/undo", ActionUndo{}))
 		commands = append(commands, NewCommandItem(c.com.Styles, "redo", "Redo Last Undo", "/redo", ActionRedo{}))
+		commands = append(commands, NewCommandItem(c.com.Styles, "coder", "Agent: Coder", "/coder", ActionSetAgent{AgentID: "coder"}))
+		commands = append(commands, NewCommandItem(c.com.Styles, "plan", "Agent: Plan", "/plan", ActionSetAgent{AgentID: "plan"}))
+		commands = append(commands, NewCommandItem(c.com.Styles, "plan-read-only", "Agent: Plan (read-only)", "/plan-read-only", ActionSetAgent{AgentID: "plan-read-only"}))
+		commands = append(commands, NewCommandItem(c.com.Styles, "agent_next", "Agent: cycle next", "tab", ActionCycleAgent{Direction: 1}))
+		commands = append(commands, NewCommandItem(c.com.Styles, "agent_prev", "Agent: cycle previous", "", ActionCycleAgent{Direction: -1}))
 		commands = append(commands, NewCommandItem(c.com.Styles, "summarize", "Summarize Session", "", ActionSummarize{SessionID: c.sessionID}))
 	}
 

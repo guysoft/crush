@@ -106,6 +106,12 @@ type (
 	ActionUndo struct{}
 	// ActionRedo is a message to re-insert the messages removed by the most recent ActionUndo.
 	ActionRedo struct{}
+	// ActionCycleAgent moves the primary-agent selection forward (+1) or
+	// backward (-1) through the list from Workspace.ListPrimaryAgents.
+	ActionCycleAgent struct{ Direction int }
+	// ActionSetAgent switches the primary agent for the current session to
+	// the given ID (e.g. from a /plan or /coder palette entry).
+	ActionSetAgent struct{ AgentID string }
 )
 
 // Messages for MCP OAuth authentication dialog.
