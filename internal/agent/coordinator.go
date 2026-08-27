@@ -1038,7 +1038,20 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 				return copilotResponsesModels[modelID]
 			}),
 		)
-		httpClient = copilot.NewClient(isSubAgent, c.cfg.Config().Options.Debug)
+		// Bypass the short-lived IDE-token dance: send the long-lived
+		// GitHub OAuth token (stored as RefreshToken on the OAuthToken)
+		// as the Bearer instead. The Copilot chat endpoint accepts
+		// either credential, and using the OAuth token eliminates the
+		// in-flight refresh-loop failure mode where a fresh IDE token
+		// still gets rejected with "IDE token expired". Read fresh on
+		// every request so a live re-login is picked up without
+		// rebuilding the client. See internal/oauth/copilot/client.go
+		// and opencode's copilot plugin for the same pattern.
+		httpClient = copilot.NewClient(
+			isSubAgent,
+			c.cfg.Config().Options.Debug,
+			c.copilotGithubToken,
+		)
 	}
 	if httpClient == nil && c.cfg.Config().Options.Debug {
 		httpClient = log.NewHTTPClient()
@@ -1336,8 +1349,29 @@ func (c *coordinator) refreshTokenIfExpired(ctx context.Context, providerCfg con
 	if providerCfg.OAuthToken == nil || !providerCfg.OAuthToken.IsExpired() {
 		return nil
 	}
+	// Copilot request auth is the long-lived GitHub OAuth token (see
+	// copilotGithubToken + copilot.NewClient); the AccessToken /
+	// ExpiresAt on OAuthToken track the unused IDE-token lifecycle.
+	// Refreshing it here would spin the loop that this fix set out to
+	// eliminate.
+	if providerCfg.ID == string(catwalk.InferenceProviderCopilot) {
+		return nil
+	}
 	slog.Debug("Token needs to be refreshed", "provider", providerCfg.ID)
 	return c.refreshOAuth2Token(ctx, providerCfg)
+}
+
+// copilotGithubToken returns the ghu_... GitHub OAuth token stored on
+// the Copilot provider config, or "" when Copilot is not configured
+// (allowing the transport to fall through to whatever Authorization
+// header the SDK set). Called once per outbound request via the
+// copilot.TokenAccessor closure; must not cache.
+func (c *coordinator) copilotGithubToken() string {
+	pc, ok := c.cfg.Config().Providers.Get(string(catwalk.InferenceProviderCopilot))
+	if !ok || pc.OAuthToken == nil {
+		return ""
+	}
+	return pc.OAuthToken.RefreshToken
 }
 
 // retryAfterUnauthorized attempts to refresh credentials after an auth error
@@ -1347,6 +1381,21 @@ func (c *coordinator) refreshTokenIfExpired(ctx context.Context, providerCfg con
 // user completes it (or the context is cancelled).
 func (c *coordinator) retryAfterUnauthorized(ctx context.Context, providerCfg config.ProviderConfig) error {
 	switch {
+	case providerCfg.ID == string(catwalk.InferenceProviderCopilot):
+		// Copilot uses the ghu_... GitHub OAuth token verbatim (see
+		// copilotGithubToken), no exchange, no expiry on the request
+		// path. A 401 here therefore means the user's token was
+		// revoked or the account no longer has Copilot access —
+		// there is nothing to refresh, only re-auth can fix it.
+		slog.Info("Copilot 401. Waiting for re-authentication", "provider", providerCfg.ID)
+		if c.notify != nil {
+			c.notify.Publish(pubsub.CreatedEvent, notify.Notification{
+				Type:       notify.TypeReAuthenticate,
+				ProviderID: providerCfg.ID,
+			})
+			return c.waitForInteractiveReauth(ctx, providerCfg.ID)
+		}
+		return errNoInteractiveAuth
 	case providerCfg.OAuthToken != nil:
 		slog.Debug("Received 401. Refreshing token and retrying", "provider", providerCfg.ID)
 		if err := c.refreshOAuth2Token(ctx, providerCfg); err != nil {

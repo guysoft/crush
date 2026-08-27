@@ -14,17 +14,43 @@ import (
 
 var assistantRolePattern = regexp.MustCompile(`"role"\s*:\s*"assistant"`)
 
-// NewClient creates a new HTTP client with a custom transport that adds the
-// X-Initiator header based on message history in the request body.
-func NewClient(isSubAgent, debug bool) *http.Client {
+// TokenAccessor returns the GitHub OAuth token (ghu_...) to send as the
+// Bearer credential on every Copilot API request. Called once per request
+// so a live re-login is picked up without rebuilding the client.
+//
+// Return an empty string to skip the override and let whatever
+// Authorization header the caller (typically the OpenAI SDK) set stand.
+type TokenAccessor func() string
+
+// NewClient creates a new HTTP client with a custom transport that:
+//
+//  1. Sets the X-Initiator header from the message-history shape.
+//  2. Overrides the Authorization header with a Bearer of the GitHub
+//     OAuth token supplied by ghToken, bypassing the short-lived
+//     "IDE token" (tid=...;exp=...) exchange that upstream crush uses.
+//     The Copilot chat endpoint accepts either credential (verified) and
+//     the GitHub OAuth token does not expire on the request path, so
+//     using it directly eliminates the in-flight refresh loop that
+//     otherwise wedges after the IDE token's exp field passes. Opencode
+//     uses the same approach — see
+//     packages/opencode/src/plugin/github-copilot/copilot.ts.
+//
+// ghToken may be nil for legacy callers; when nil the transport keeps
+// whatever Authorization header the caller set.
+func NewClient(isSubAgent, debug bool, ghToken TokenAccessor) *http.Client {
 	return &http.Client{
-		Transport: &initiatorTransport{debug: debug, isSubAgent: isSubAgent},
+		Transport: &initiatorTransport{
+			debug:      debug,
+			isSubAgent: isSubAgent,
+			ghToken:    ghToken,
+		},
 	}
 }
 
 type initiatorTransport struct {
 	debug      bool
 	isSubAgent bool
+	ghToken    TokenAccessor
 }
 
 func (t *initiatorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -43,6 +69,7 @@ func (t *initiatorTransport) RoundTrip(req *http.Request) (*http.Response, error
 		// so both must be handled before reading below.
 		req.Header.Set(xInitiatorHeader, userInitiator)
 		slog.Debug("Setting X-Initiator header to user (no request body)")
+		t.applyGithubBearer(req)
 		return t.roundTrip(req)
 	}
 
@@ -70,7 +97,26 @@ func (t *initiatorTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	req.Header.Set(xInitiatorHeader, initiator)
 
+	t.applyGithubBearer(req)
 	return t.roundTrip(req)
+}
+
+// applyGithubBearer overwrites any Authorization header the upstream
+// (e.g. the OpenAI SDK's WithAPIKey) placed on the request with a fresh
+// `Bearer <ghToken>`. Uses req.Header.Del to clear case variants like
+// "authorization" that request cloning may have preserved separately.
+func (t *initiatorTransport) applyGithubBearer(req *http.Request) {
+	if t.ghToken == nil {
+		return
+	}
+	tok := t.ghToken()
+	if tok == "" {
+		return
+	}
+	// Delete any pre-existing casing variant.
+	req.Header.Del("Authorization")
+	req.Header.Del("authorization")
+	req.Header.Set("Authorization", "Bearer "+tok)
 }
 
 func (t *initiatorTransport) roundTrip(req *http.Request) (*http.Response, error) {
