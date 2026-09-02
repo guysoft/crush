@@ -38,6 +38,33 @@ jobs:
           echo "fork_full=$fork_full" >> "$GITHUB_OUTPUT"
           echo "Fork version:   $fork_full"
           echo "Upstream base:  $upstream"
+      - id: prev
+        name: Determine previous tag for changelog
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          upstream="${{ steps.v.outputs.upstream }}"
+          # Prefer the most recent prior fork tag (matching v<fork>-crush<upstream>[-suffix]).
+          prev_fork=$(git tag -l 'v*-crush*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-crush[0-9]+\.[0-9]+\.[0-9]+(-.+)?$' | grep -v "^${tag}$" | head -1 || true)
+          if [ -n "$prev_fork" ]; then
+            prev="$prev_fork"
+            src=fork
+          else
+            # First fork tag: fall back to the upstream base tag. Fetch it from
+            # upstream so goreleaser can compute a diff.
+            git remote add charmbracelet https://github.com/charmbracelet/crush.git 2>/dev/null || true
+            git fetch --no-tags --depth=1 charmbracelet "refs/tags/v${upstream}:refs/tags/v${upstream}" || true
+            if git rev-parse "v${upstream}" >/dev/null 2>&1; then
+              prev="v${upstream}"
+              src=upstream
+            else
+              # No usable base; goreleaser will fall back to root of history.
+              prev=""
+              src=none
+            fi
+          fi
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          echo "Previous tag ($src): ${prev:-<none>}"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -48,3 +75,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_VERSION: ${{ steps.v.outputs.upstream }}
+          GORELEASER_PREVIOUS_TAG: ${{ steps.prev.outputs.prev }}
