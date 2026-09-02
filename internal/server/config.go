@@ -94,6 +94,30 @@ func (c *controllerV1) handlePostWorkspaceConfigModel(w http.ResponseWriter, r *
 	w.WriteHeader(http.StatusOK)
 }
 
+// handlePostWorkspaceConfigModelOverride sets the preferred model in
+// memory only, without persisting it to any config file.
+//
+//	@Summary		Override preferred model (in-memory)
+//	@Tags			config
+//	@Param			request	body	proto.ConfigModelRequest	true	"Config model request"
+//	@Router			/workspaces/{id}/config/model-override [post]
+func (c *controllerV1) handlePostWorkspaceConfigModelOverride(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var req proto.ConfigModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		c.server.logError(r, "Failed to decode request", "error", err)
+		jsonError(w, http.StatusBadRequest, "failed to decode request")
+		return
+	}
+
+	if err := c.backend.OverridePreferredModelInMemory(id, req.ModelType, req.Model); err != nil {
+		c.handleError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 // handlePostWorkspaceConfigCompact sets compact mode.
 //
 //	@Summary		Set compact mode

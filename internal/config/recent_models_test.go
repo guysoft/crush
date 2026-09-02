@@ -156,3 +156,31 @@ func TestUpdatePreferredModel_TypeIsolation(t *testing.T) {
 	require.Len(t, store.Config().RecentModels[SelectedModelTypeSmall], 1)
 	require.Equal(t, smallModel, store.Config().RecentModels[SelectedModelTypeSmall][0])
 }
+
+func TestOverridePreferredModel_DoesNotPersist(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := &Config{}
+	cfg.setDefaults(dir, "")
+	store := testStoreWithPath(cfg, dir)
+
+	sel := SelectedModel{Provider: "openai", Model: "gpt-4o"}
+
+	// Seed a persisted baseline so the assertion below can prove the
+	// override never touched the file.
+	require.NoError(t, store.UpdatePreferredModel(ScopeGlobal, SelectedModelTypeLarge, SelectedModel{Provider: "anthropic", Model: "claude"}))
+	baseline, err := os.ReadFile(store.globalDataPath)
+	require.NoError(t, err)
+
+	store.OverridePreferredModel(SelectedModelTypeLarge, sel)
+
+	// In-memory state reflects the override.
+	require.Equal(t, sel, store.Config().Models[SelectedModelTypeLarge])
+
+	// The override must NOT land on disk: no model write, no recents write.
+	after, err := os.ReadFile(store.globalDataPath)
+	require.NoError(t, err)
+	require.Equal(t, string(baseline), string(after),
+		"OverridePreferredModel must not persist anything to disk")
+}

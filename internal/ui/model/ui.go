@@ -2606,7 +2606,16 @@ func (m *UI) restoreModelFromSession(msgs []message.Message) tea.Cmd {
 		Provider: lastAssistant.Provider,
 		Model:    lastAssistant.Model,
 	}
-	if err := m.com.Workspace.UpdatePreferredModel(config.ScopeGlobal, config.SelectedModelTypeLarge, selectedModel); err != nil {
+	slog.Info("Session model restore",
+		"from_provider", currentLarge.Provider,
+		"from_model", currentLarge.Model,
+		"to_provider", lastAssistant.Provider,
+		"to_model", lastAssistant.Model)
+	// Restore in memory only: loading a session must not silently rewrite
+	// the user's stored global model preference. Matches the app.go
+	// (non-interactive) restore semantics, which are documented as
+	// non-persistent.
+	if err := m.com.Workspace.OverridePreferredModelInMemory(config.SelectedModelTypeLarge, selectedModel); err != nil {
 		slog.Error("Failed to restore model from session", "error", err)
 		return nil
 	}
@@ -2615,7 +2624,7 @@ func (m *UI) restoreModelFromSession(msgs []message.Message) tea.Cmd {
 
 	if _, ok := cfg.Models[config.SelectedModelTypeSmall]; !ok {
 		smallModel := m.com.Workspace.GetDefaultSmallModel(lastAssistant.Provider)
-		if err := m.com.Workspace.UpdatePreferredModel(config.ScopeGlobal, config.SelectedModelTypeSmall, smallModel); err != nil {
+		if err := m.com.Workspace.OverridePreferredModelInMemory(config.SelectedModelTypeSmall, smallModel); err != nil {
 			slog.Error("Failed to set small model during session restore", "error", err)
 		}
 	}
@@ -4397,10 +4406,10 @@ func (m *UI) randomizePlaceholders() {
 // Layout invariant (relied on by editorCursorOffset for cursor screen
 // placement):
 //
-//   row 0: attachments  (blank string when none — keeps the row present)
-//   row 1: agent header (blank string only when no primaries configured)
-//   row 2: bordered textarea (starts here — see editorCursorOffset dy)
-//   row 3: bottom margin
+//	row 0: attachments  (blank string when none — keeps the row present)
+//	row 1: agent header (blank string only when no primaries configured)
+//	row 2: bordered textarea (starts here — see editorCursorOffset dy)
+//	row 3: bottom margin
 //
 // Do NOT switch to conditional row emission: cursor Y is offset by a
 // constant `editorCursorDY` derived from this shape.
@@ -4428,8 +4437,8 @@ func (m *UI) renderEditorView(width int) string {
 // textarea's own (0, 0) origin to its screen-space position inside the
 // editor layout region:
 //
-//   dx = 1 (app left margin) + 1 (agent-color border column) + 1 (left padding)
-//   dy = 1 (attachments row)  + 1 (agent header row)
+//	dx = 1 (app left margin) + 1 (agent-color border column) + 1 (left padding)
+//	dy = 1 (attachments row)  + 1 (agent header row)
 //
 // See renderEditorView for the layout the constants encode. Consumers:
 // the terminal-cursor return in handleKeyPressMsg and completionsPosition

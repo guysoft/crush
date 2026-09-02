@@ -88,6 +88,20 @@ func (b *Backend) UpdatePreferredModel(workspaceID string, scope config.Scope, m
 	return nil
 }
 
+// OverridePreferredModelInMemory sets the preferred model for the given
+// type in memory only, without persisting it to any config file. Used for
+// session-scoped restores that must not silently rewrite the user's
+// stored model preference.
+func (b *Backend) OverridePreferredModelInMemory(workspaceID string, modelType config.SelectedModelType, model config.SelectedModel) error {
+	ws, err := b.GetWorkspace(workspaceID)
+	if err != nil {
+		return err
+	}
+	ws.Cfg.OverridePreferredModel(modelType, model)
+	publishConfigChanged(ws)
+	return nil
+}
+
 // SetCompactMode sets the compact mode setting and persists it.
 func (b *Backend) SetCompactMode(workspaceID string, scope config.Scope, enabled bool) error {
 	ws, err := b.GetWorkspace(workspaceID)

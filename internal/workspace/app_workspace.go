@@ -386,6 +386,14 @@ func (w *AppWorkspace) UpdatePreferredModel(scope config.Scope, modelType config
 	return w.store.UpdatePreferredModel(scope, modelType, model)
 }
 
+// OverridePreferredModelInMemory sets the preferred model in memory only,
+// without persisting it to any config file. Used for session-scoped
+// restores that must not rewrite the user's stored model preference.
+func (w *AppWorkspace) OverridePreferredModelInMemory(modelType config.SelectedModelType, model config.SelectedModel) error {
+	w.store.OverridePreferredModel(modelType, model)
+	return nil
+}
+
 func (w *AppWorkspace) SetCompactMode(scope config.Scope, enabled bool) error {
 	return w.store.SetCompactMode(scope, enabled)
 }

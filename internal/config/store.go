@@ -531,6 +531,11 @@ func (s *ConfigStore) RemoveConfigField(scope Scope, key string) error {
 // latency); agents are refreshed separately by the caller (see
 // UpdateAgentModel).
 func (s *ConfigStore) UpdatePreferredModel(scope Scope, modelType SelectedModelType, model SelectedModel) error {
+	slog.Info("Preferred model persisted",
+		"scope", scope,
+		"model_type", modelType,
+		"provider", model.Provider,
+		"model", model.Model)
 	return s.update(scope, func(c *Config) map[string]any {
 		return s.updatePreferredModelFields(c, modelType, model)
 	})
