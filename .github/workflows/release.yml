@@ -6,7 +6,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,6 +21,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - id: v
+        name: Validate tag and extract versions
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          re='^v[0-9]+\.[0-9]+\.[0-9]+-crush[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$'
+          if ! [[ "$tag" =~ $re ]]; then
+            echo "::error::Tag '$tag' does not match required format v<FORK>-crush<UPSTREAM>[-<SUFFIX>]"
+            echo "::error::Example: v0.1.0-crush0.89.0 or v0.1.0-crush0.89.0-rc1"
+            exit 1
+          fi
+          upstream="${tag##*-crush}"; upstream="${upstream%%-*}"
+          fork_full="${tag#v}"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "fork_full=$fork_full" >> "$GITHUB_OUTPUT"
+          echo "Fork version:   $fork_full"
+          echo "Upstream base:  $upstream"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -31,3 +47,4 @@ jobs:
           args: release --clean --config .goreleaser.fork.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_VERSION: ${{ steps.v.outputs.upstream }}
