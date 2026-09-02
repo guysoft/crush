@@ -306,6 +306,11 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	}
 
 	model := acting.Model()
+	slog.Info("Run dispatch",
+		"session_id", sessionID,
+		"acting_agent", actingCfg.ID,
+		"acting_provider", model.ModelCfg.Provider,
+		"acting_model", model.ModelCfg.Model)
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
 		maxTokens = model.ModelCfg.MaxTokens
@@ -1298,7 +1303,23 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.currentAgent.SetModels(large, small)
+	// Every primary agent can be handed a run via resolvePrimary, so the
+	// refreshed models must reach all of them, not just the coder. Without
+	// the fan-out, non-coder agents silently keep the models they were
+	// built with at startup and run against the wrong (possibly paid)
+	// provider after a model switch.
+	updated := make([]string, 0, len(c.agents))
+	for id, a := range c.agents {
+		a.SetModels(large, small)
+		updated = append(updated, id)
+	}
+	if c.currentAgent != nil {
+		c.currentAgent.SetModels(large, small)
+	}
+	slog.Info("UpdateModels applied",
+		"large_provider", large.ModelCfg.Provider,
+		"large_model", large.ModelCfg.Model,
+		"agents_updated", updated)
 
 	agentCfg, ok := c.cfg.Config().Agents[config.AgentCoder]
 	if !ok {
@@ -1824,5 +1845,3 @@ func (c *coordinator) SetCurrentPrimary(ctx context.Context, sessionID, agentID 
 	}
 	return c.IsSessionBusy(sessionID), nil
 }
-
-

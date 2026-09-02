@@ -12,16 +12,25 @@ import (
 	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/bedrock"
 	"charm.land/fantasy/providers/openaicompat"
+	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // mockSessionAgent is a minimal mock for the SessionAgent interface.
 type mockSessionAgent struct {
-	model     Model
-	runFunc   func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
-	cancelled []string
+	model        Model
+	runFunc      func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
+	cancelled    []string
+	setModelsLog []SetModelsCall
+}
+
+// SetModelsCall records a SetModels invocation for assertions.
+type SetModelsCall struct {
+	Large Model
+	Small Model
 }
 
 func (m *mockSessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -32,8 +41,10 @@ func (m *mockSessionAgent) BeginAccepted(sessionID string) *AcceptedRun {
 	return &AcceptedRun{sessionID: sessionID}
 }
 
-func (m *mockSessionAgent) Model() Model                        { return m.model }
-func (m *mockSessionAgent) SetModels(large, small Model)        {}
+func (m *mockSessionAgent) Model() Model { return m.model }
+func (m *mockSessionAgent) SetModels(large, small Model) {
+	m.setModelsLog = append(m.setModelsLog, SetModelsCall{Large: large, Small: small})
+}
 func (m *mockSessionAgent) SetTools(tools []fantasy.AgentTool)  {}
 func (m *mockSessionAgent) SetSystemPrompt(systemPrompt string) {}
 func (m *mockSessionAgent) Cancel(sessionID string) {
@@ -579,4 +590,82 @@ func TestGetProviderOptionsReasoningEffortFallback(t *testing.T) {
 	thinking, ok := parsed.ExtraBody["thinking"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "enabled", thinking["type"])
+}
+
+// newUpdateModelsTestCoordinator builds a coordinator wired with mock
+// session agents for every primary agent id, plus provider/model config
+// that buildAgentModels can resolve.
+func newUpdateModelsTestCoordinator(t *testing.T) (*coordinator, map[string]*mockSessionAgent) {
+	t.Helper()
+
+	env := testEnv(t)
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+
+	const (
+		providerID = "test-provider"
+		largeID    = "large-model"
+		smallID    = "small-model"
+	)
+
+	cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:      providerID,
+		Name:    providerID,
+		Type:    openaicompat.Name,
+		BaseURL: "https://example.invalid/v1",
+		APIKey:  "test-key",
+		Models: []catwalk.Model{
+			{ID: largeID, Name: "Large Model"},
+			{ID: smallID, Name: "Small Model"},
+		},
+	})
+	cfg.Config().Models[config.SelectedModelTypeLarge] = config.SelectedModel{
+		Provider: providerID,
+		Model:    largeID,
+	}
+	cfg.Config().Models[config.SelectedModelTypeSmall] = config.SelectedModel{
+		Provider: providerID,
+		Model:    smallID,
+	}
+
+	broker := pubsub.NewBroker[notify.RunComplete]()
+	t.Cleanup(broker.Shutdown)
+
+	coord := &coordinator{
+		cfg:         cfg,
+		sessions:    env.sessions,
+		messages:    env.messages,
+		permissions: env.permissions,
+		notify:      pubsub.NewBroker[notify.Notification](),
+		runComplete: broker,
+		agents:      make(map[string]SessionAgent),
+	}
+
+	agents := map[string]*mockSessionAgent{}
+	for _, id := range []string{config.AgentCoder, config.AgentPlan} {
+		m := &mockSessionAgent{}
+		coord.agents[id] = m
+		agents[id] = m
+	}
+	coord.currentAgent = agents[config.AgentCoder]
+
+	return coord, agents
+}
+
+// TestUpdateModelsFansOutToAllPrimaryAgents verifies that UpdateModels
+// propagates the freshly built models to every primary agent, not just the
+// coder. Non-coder agents are handed runs via resolvePrimary, so missing
+// them leaves them running on their stale startup models.
+func TestUpdateModelsFansOutToAllPrimaryAgents(t *testing.T) {
+	coord, agents := newUpdateModelsTestCoordinator(t)
+
+	err := coord.UpdateModels(t.Context())
+	require.NoError(t, err)
+
+	for id, a := range agents {
+		require.NotEmpty(t, a.setModelsLog, "agent %q received no model update", id)
+		last := a.setModelsLog[len(a.setModelsLog)-1]
+		assert.Equal(t, "large-model", last.Large.ModelCfg.Model, "agent %q large model", id)
+		assert.Equal(t, "small-model", last.Small.ModelCfg.Model, "agent %q small model", id)
+	}
 }
